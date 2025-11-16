@@ -4,6 +4,142 @@ import os
 import tempfile
 from pathlib import Path
 import time
+from datetime import timedelta
+
+
+def format_timestamp(seconds: float) -> str:
+    """
+    Convert seconds to SRT timestamp format (HH:MM:SS,mmm)
+
+    Args:
+        seconds: Time in seconds
+
+    Returns:
+        Formatted timestamp string
+    """
+    td = timedelta(seconds=seconds)
+    hours = int(td.total_seconds() // 3600)
+    minutes = int((td.total_seconds() % 3600) // 60)
+    secs = int(td.total_seconds() % 60)
+    millis = int((td.total_seconds() % 1) * 1000)
+
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def split_text_by_punctuation(text: str, max_chars: int = 40) -> list:
+    """
+    Split text into smaller chunks based on punctuation marks and length limit.
+
+    Args:
+        text: The text to split
+        max_chars: Maximum characters per subtitle line
+
+    Returns:
+        List of text chunks
+    """
+    # Common Chinese and English punctuation marks
+    punctuation = ['。', '!', '?', ',', ',', '.', '!', '?', ';', ';', ':', ':']
+
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    current_chunk = ""
+
+    # Try to split by punctuation
+    i = 0
+    while i < len(text):
+        char = text[i]
+        current_chunk += char
+
+        # Check if we hit a punctuation mark
+        if char in punctuation:
+            # If chunk is getting long enough, save it
+            if len(current_chunk) >= max_chars * 0.6:  # At least 60% of max
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+            # Or if next chunk would be too long, save current chunk
+            elif len(current_chunk) > max_chars * 0.3:
+                # Look ahead to see if we should break here
+                remaining = text[i+1:].strip()
+                if remaining and len(remaining) > max_chars * 0.5:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+
+        # Force split if chunk is too long
+        elif len(current_chunk) >= max_chars:
+            # Try to find last space or punctuation
+            last_break = -1
+            for j in range(len(current_chunk) - 1, max(0, len(current_chunk) - 20), -1):
+                if current_chunk[j] in punctuation + [' ', '　']:
+                    last_break = j
+                    break
+
+            if last_break > 0:
+                chunks.append(current_chunk[:last_break + 1].strip())
+                current_chunk = current_chunk[last_break + 1:]
+            else:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+
+        i += 1
+
+    # Add remaining text
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+def generate_srt(segments: list, max_chars: int = 40) -> str:
+    """
+    Generate SRT subtitle content from Whisper segments
+
+    Args:
+        segments: List of transcription segments with timestamps
+        max_chars: Maximum characters per subtitle line
+
+    Returns:
+        SRT formatted string
+    """
+    srt_content = ""
+    subtitle_index = 1
+
+    for segment in segments:
+        text = segment['text'].strip()
+        start = segment['start']
+        end = segment['end']
+        duration = end - start
+
+        # Split text into smaller chunks
+        chunks = split_text_by_punctuation(text, max_chars)
+
+        if len(chunks) == 1:
+            # Single chunk, use original timing
+            srt_content += f"{subtitle_index}\n"
+            srt_content += f"{format_timestamp(start)} --> {format_timestamp(end)}\n"
+            srt_content += f"{chunks[0]}\n\n"
+            subtitle_index += 1
+        else:
+            # Multiple chunks, distribute timing proportionally
+            total_chars = sum(len(chunk) for chunk in chunks)
+            current_time = start
+
+            for chunk in chunks:
+                # Calculate proportional duration based on character count
+                chunk_duration = (len(chunk) / total_chars) * duration
+                chunk_end = min(current_time + chunk_duration, end)
+
+                srt_content += f"{subtitle_index}\n"
+                srt_content += f"{format_timestamp(current_time)} --> {format_timestamp(chunk_end)}\n"
+                srt_content += f"{chunk}\n\n"
+
+                subtitle_index += 1
+                current_time = chunk_end
+
+    return srt_content
+
 
 # Page configuration
 st.set_page_config(
@@ -69,6 +205,8 @@ with st.sidebar.expander("🔧 高级选项"):
                                 help="束搜索的大小，较大的值可能提高准确性但速度较慢")
     best_of = st.number_input("Best Of", 1, 10, 5,
                               help="从多少个候选中选择最佳结果")
+    max_chars = st.number_input("字幕每行最大字符数", 20, 80, 40,
+                               help="SRT字幕每行的最大字符数，用于控制字幕显示长度")
 
 # Warning for turbo model and translation
 if selected_model == "turbo" and selected_task == "translate":
@@ -176,6 +314,16 @@ if uploaded_file is not None:
                 file_name=f"{Path(uploaded_file.name).stem}_transcription.txt",
                 mime="text/plain"
             )
+
+            # Download button for SRT subtitles
+            if "segments" in result and len(result["segments"]) > 0:
+                srt_content = generate_srt(result["segments"], max_chars=max_chars)
+                st.download_button(
+                    label="📥 下载SRT字幕文件",
+                    data=srt_content,
+                    file_name=f"{Path(uploaded_file.name).stem}_subtitles.srt",
+                    mime="text/plain"
+                )
 
             # Show segments if available
             if "segments" in result and len(result["segments"]) > 0:
